@@ -1,5 +1,7 @@
 # PicoRV32 XIP Boot Demonstration — Basys 3
 
+**Repository**: [github.com/ayush130305/PicoRV32-XIP-Boot-Demonstration-Basys-3](https://github.com/ayush130305/PicoRV32-XIP-Boot-Demonstration-Basys-3)
+
 ## What the project does
 
 A RISC-V soft CPU (PicoRV32) is configured onto a Digilent Basys 3
@@ -29,6 +31,8 @@ built so far is write-only. Extending this to accept real input
 
 ## Files
 
+**New for this integration:**
+
 | File | Description |
 |---|---|
 | `basys3_top.sv` | Top-level module. Wires every other module together into the complete system, and is the only file with real physical board pins as ports. |
@@ -37,9 +41,24 @@ built so far is write-only. Extending this to accept real input
 | `sram.sv` | 8KB of on-chip Block RAM — the CPU's stack/scratch memory. |
 | `led_peripheral.sv` | A single register wired directly to the 16 LEDs. |
 | `seven_seg.sv` | Drives the 4-digit display. Unlike the LED peripheral, this one runs its own continuous internal refresh loop, independent of software. |
-| `qspi_axi_top.sv` (+ sub-modules) | The pre-existing QSPI flash controller IP this whole project is built on top of — handles both ordinary register-based flash access and the XIP path. Unmodified by this integration. |
 | `led_chase.S` / `.bin` | The actual RISC-V program the CPU runs — assembly source and its compiled machine code. |
 | `basys3_top.xdc` | Physical constraints file — maps every logical signal in the design to a real, physical pin on the FPGA package. |
+| `picorv32.v` | The real, unmodified PicoRV32 core source (external — see the Theory section for what it can do). |
+
+**The pre-existing QSPI flash controller IP** (built on top of, not
+modified — 9 files):
+
+| File | Description |
+|---|---|
+| `qspi_axi_pkg.sv` | Shared constants — register offsets, bit positions — imported by several of the files below. Not a module itself, just a package. |
+| `pulse_sync.sv` | A single-bit clock-domain-crossing primitive — safely passes a one-cycle pulse from one clock domain to another. |
+| `cdc_bridge.sv` | Uses `pulse_sync.sv` to safely cross every control/data signal between the CPU's clock domain (`ACLK`) and the QSPI engine's own clock domain (`QCLK`). |
+| `qspi_engine.sv` | The actual QSPI shift engine — walks a transaction through its command/address/dummy/data phases and drives the real `io0`-`io3` pins. Has no knowledge of AXI at all. |
+| `qspi_arbiter.sv` | Since two different things can both want to use the QSPI engine (ordinary register access, and XIP fetches), this decides who gets it and keeps their responses from crossing wires. |
+| `axi4L_slave.sv` | The ordinary, register-based AXI4-Lite interface to the QSPI engine — control/status/data registers a CPU can read and write directly. |
+| `qspi_xip_slave.sv` | The memory-mapped, read-only interface — any AXI read landing in the XIP address range transparently becomes a real QSPI flash read. |
+| `qspi_unified_slave.sv` | Merges the register interface and the XIP interface into one single external AXI4-Lite port, since PicoRV32 only has one bus port to offer. |
+| `qspi_axi_top.sv` | The wrapper tying all 8 files above together into one module — this is what `basys3_top.sv` actually instantiates. |
 
 ---
 
@@ -73,6 +92,45 @@ Every peripheral sits behind the same kind of interface (AXI4-Lite —
 see theory below), which is exactly what lets `system_router.sv` treat
 them uniformly: it doesn't need to know *what* a peripheral does, only
 *which address range* it owns.
+
+### Inside `qspi_axi_top.sv` — the pre-existing IP's own internal structure
+
+The main diagram above shows `qspi_axi_top.sv` as one block. Internally,
+it's actually 9 separate files with a real, specific topology:
+
+```
+        Single AXI4-Lite port (from system_router.sv)
+                          │
+                          ▼
+              qspi_unified_slave.sv
+     (routes by address: register range → left,
+              XIP range → right)
+                 │                 │
+                 ▼                 ▼
+        axi4L_slave.sv     qspi_xip_slave.sv
+        (register-based     (memory-mapped,
+         read/write)          read-only XIP)
+                 │                 │
+                 └────────┬────────┘
+                          ▼
+                  qspi_arbiter.sv
+       (only one of the two above can use the
+              engine at any moment)
+                          │
+                          ▼
+                   cdc_bridge.sv
+       (crosses from ACLK's clock domain into
+        QCLK's — uses pulse_sync.sv internally)
+                          │
+                          ▼
+                   qspi_engine.sv
+         (drives the real io0-io3 pins directly)
+
+  qspi_axi_pkg.sv: shared constants (register
+  offsets, bit positions) imported by several
+  of the modules above — not part of the flow
+  itself, just a shared definitions file.
+```
 
 ---
 
@@ -248,6 +306,61 @@ mapping each 4-bit value 0-F to the correct pattern of lit segments).
 Both the digit-select and segment signals are active-low on this board
 specifically (confirmed against Digilent's own documentation).
 
+### `qspi_axi_pkg.sv`
+Not a module — a shared package. Defines register offsets
+(`REG_CTRL_CMD`, `REG_ADDR`, `REG_NUM_BYTES`, `REG_STATUS`,
+`REG_TX_DATA`, etc.) as named constants, imported by several of the
+files below so none of them have to hardcode raw addresses.
+
+### `pulse_sync.sv`
+A single-bit clock-domain-crossing primitive. Safely passes a one-cycle
+pulse from a source clock domain to a destination clock domain, used
+internally by `cdc_bridge.sv`.
+
+### `cdc_bridge.sv`
+Since the CPU/AXI side runs on `ACLK` and the QSPI engine runs on its
+own, independent `QCLK`, every signal crossing between them needs
+careful handling — this module does that crossing, using `pulse_sync.sv`
+for control pulses and standard synchronizer logic for level signals.
+
+### `qspi_engine.sv`
+The actual QSPI shift engine. Walks a transaction through command,
+address, dummy, and data phases, driving and sampling the real `io0`-
+`io3` pins directly. Has no concept of AXI at all — it only knows about
+a simple control/status interface, already crossed into its own clock
+domain by `cdc_bridge.sv`.
+
+### `qspi_arbiter.sv`
+Two different things can want to use the QSPI engine at once — an
+ordinary register-based request, or an XIP fetch. This module decides
+who actually gets it at any given moment, and makes sure each side only
+ever sees its own completion.
+
+### `axi4L_slave.sv`
+The register-based AXI4-Lite interface — control/status/data registers
+a CPU can read and write directly for ordinary (non-XIP) flash access.
+
+### `qspi_xip_slave.sv`
+The memory-mapped, read-only interface. Any AXI read landing in the XIP
+address range transparently becomes a real QSPI flash read, with no
+register writes or polling involved from the requester's side.
+
+### `qspi_unified_slave.sv`
+Merges `axi4L_slave.sv`'s register interface and `qspi_xip_slave.sv`'s
+XIP interface into one single external AXI4-Lite port — built
+specifically because PicoRV32 only has one bus master port to offer,
+not separate instruction/data buses.
+
+### `qspi_axi_top.sv`
+The top-level wrapper tying all 8 files above together — this is the
+one module `basys3_top.sv` actually instantiates directly.
+
+### `picorv32.v`
+The real, unmodified PicoRV32 core source (external, not written for
+this project — see the Theory section above for its full capabilities).
+`basys3_top.sv` specifically instantiates the `picorv32_axi` variant
+from within this file.
+
 ### `led_chase.S`
 The actual program. Uses registers `t1` (LED peripheral address),
 `t5` (seven-segment address), `t0`/`t4` (the growing LED bit-pattern),
@@ -335,6 +448,60 @@ order encountered:
 
 ---
 
+## Vivado project setup — which file goes where
+
+Vivado separates sources into three distinct categories. Getting a file
+into the wrong one is a common, confusing mistake — here's the complete,
+correct placement for every file in this project.
+
+### Design Sources (synthesizable RTL — becomes real hardware)
+
+```
+qspi_axi_pkg.sv
+pulse_sync.sv
+cdc_bridge.sv
+axi4L_slave.sv
+qspi_engine.sv
+qspi_arbiter.sv
+qspi_xip_slave.sv
+qspi_unified_slave.sv
+qspi_axi_top.sv
+led_peripheral.sv
+sram.sv
+seven_seg.sv
+system_router.sv
+qe_provision.sv
+basys3_top.sv        ← set as Top Module
+picorv32.v            (real, external PicoRV32 source)
+```
+
+### Constraints
+
+```
+basys3_top.xdc
+```
+
+### Simulation Sources (never synthesized — testbench only)
+
+```
+qspi_flash_model.sv
+tb_basys3_top.sv      ← set as simulation Top Module
+led_chase_*.mem        (whichever program the testbench currently
+                         references via its $readmemh call)
+```
+
+### Not part of the Vivado project at all
+
+```
+led_chase.bin
+```
+This never gets added to any Vivado source category — it's used
+entirely outside the project, fed directly into the memory
+configuration file generation step below (as the "Datafile" at
+address `0x300000`).
+
+---
+
 ## Generating the memory configuration file
 
 The `.bit` file (FPGA configuration) and the compiled program (`.bin`)
@@ -355,8 +522,7 @@ Vivado's **Tools → Generate Memory Configuration File** does this:
 This produces a single combined `.mcs` file containing both pieces at
 their correct offsets.
 
-*<img width="1848" height="1401" alt="image" src="https://github.com/user-attachments/assets/200d208a-3f3d-4fa6-b80c-787fd85d1c6a" />
-*
+*[screenshot: the Write Memory Configuration File dialog, filled in]*
 
 ## Uploading to the board
 
@@ -376,16 +542,13 @@ With the board connected and powered on:
 7. Confirm the **DONE** LED lights, confirming successful
    reconfiguration from flash
 
-*<img width="2128" height="1492" alt="image" src="https://github.com/user-attachments/assets/937fbd87-b9a4-4108-b7aa-9ac513de2563" />
-*
+*[screenshot: Program Configuration Memory Device dialog / programming
+in progress]*
 
 ## Demonstration video
 
-*
-
-https://github.com/user-attachments/assets/cdc43b5d-107b-4e4a-b718-eeb3942edf5e
-
-*
+*[video: the board running — LED fill pattern and seven-segment counter
+visible together]*
 
 ---
 
