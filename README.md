@@ -522,7 +522,8 @@ Vivado's **Tools → Generate Memory Configuration File** does this:
 This produces a single combined `.mcs` file containing both pieces at
 their correct offsets.
 
-*[screenshot: the Write Memory Configuration File dialog, filled in]*
+<img width="1848" height="1401" alt="Screenshot 2026-08-21 200021" src="https://github.com/user-attachments/assets/4375868c-d7e7-4e9f-aeb3-811e878b51de" />
+
 
 ## Uploading to the board
 
@@ -542,13 +543,16 @@ With the board connected and powered on:
 7. Confirm the **DONE** LED lights, confirming successful
    reconfiguration from flash
 
-*[screenshot: Program Configuration Memory Device dialog / programming
-in progress]*
+<img width="2128" height="1492" alt="Screenshot 2026-08-21 200147" src="https://github.com/user-attachments/assets/45bc6cd0-86a0-4121-92cd-9d82f6094ae9" />
+
 
 ## Demonstration video
 
-*[video: the board running — LED fill pattern and seven-segment counter
-visible together]*
+
+
+https://github.com/user-attachments/assets/15a157cc-c874-452b-96f8-4964fe701dfb
+
+
 
 ---
 
