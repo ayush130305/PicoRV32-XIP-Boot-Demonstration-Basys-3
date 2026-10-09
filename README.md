@@ -1,589 +1,361 @@
-# PicoRV32 XIP Boot Demonstration — Basys 3
+# PICO RV32 - XIP - QSPI - AXI
 
-**Repository**: [github.com/ayush130305/PicoRV32-XIP-Boot-Demonstration-Basys-3](https://github.com/ayush130305/PicoRV32-XIP-Boot-Demonstration-Basys-3)
+Design Verification Document
 
-## What the project does
+This package contains two verification targets built from the same design:
 
-A RISC-V soft CPU (PicoRV32) is configured onto a Digilent Basys 3
-FPGA board and boots **directly from external QSPI flash**, with no
-bootloader and no program ever copied into RAM. The CPU fetches every
-single instruction live, straight from the flash chip, for as long as
-it runs — a technique called **XIP (execute-in-place)**.
+- **Level A, the core IP (`qspi_axi_top`)**: an AXI4-Lite slave that gives a master both a register interface and a memory-mapped, read-only execute-in-place (XIP) window onto a QSPI flash. It was built and verified first, on its own.
+- **Level B, the system (`basys3_top`)**: that core integrated with a PicoRV32 RV32I CPU, an address router, an 8 KB RAM, LED and seven-segment registers, and flash Quad-Enable provisioning logic, targeting the Digilent Basys 3 (Artix-7 XC7A35T, Macronix MX25L3233F flash).
 
-To prove this is genuinely working — not just configured, but actually
-executing real, correct code — the CPU drives two visible outputs:
+The design is synthesizable SystemVerilog around the third-party PicoRV32 core. This document is the handoff to Design Verification (DV) and treats the design as a black box. It covers both levels so that the full suite can be tested.
 
-- **16 onboard LEDs**, filling up one at a time, cumulatively, until
-  all are lit, then resetting and repeating.
-- **A 4-digit seven-segment display**, showing an independent,
-  continuously incrementing **hexadecimal** counter (`0000, 0001, ...
-  0009, 000A, ... 000F, 0010, ...`) that keeps counting across every
-  LED reset, rather than restarting alongside it.
+## Scope
 
-This currently uses only the base RV32I instruction set (RISC-V's
-minimal integer-only instruction set — addition, subtraction, loads,
-stores, branches; see the RISC-V theory section below). The CPU has no
-way to *read* anything from the outside world yet — every peripheral
-built so far is write-only. Extending this to accept real input
-(buttons, switches) is the natural next step, covered in Future Scope.
+| Level | DUT | Master | Slave side | Existing tests |
+|---|---|---|---|---|
+| A | `qspi_axi_top` | AXI4-Lite master (testbench) | QSPI flash pins | 18 register-path, 11 XIP |
+| B | `basys3_top` | `picorv32_axi` (real CPU) | flash pins, LEDs, display | 14 system, 7 RAM |
+
+Level A is the primary target. Level B is the integration check that the same core works behind a real CPU and a router.
+
+## Features
+
+Core (Level A):
+
+- One external AXI4-Lite slave port covering both registers and the XIP window; address-steered reads, register-only writes
+- Register interface to run arbitrary QSPI transactions: opcode, 24- or 32-bit address, single/dual/quad lines on address and data, 0-255 dummy cycles, read or write, up to 4095 bytes
+- Memory-mapped XIP: an ordinary AXI read inside the window becomes a flash read using one fixed, pre-programmed configuration (XIP_CFG)
+- Register path and XIP path share one flash interface; the register path wins a simultaneous request and a running transaction is never preempted
+- ABORT strobe that cancels any phase of any transaction, and a timeout safety net that raises ERROR
+- Sticky, write-1-to-clear DONE and ERROR status; read- and write-cleared TX_READY and RX_READY
+- Two clock domains, `ACLK` (AXI side) and `qclk` (QSPI side)
+- Explicit DECERR on reads that hit neither a register nor the XIP window
+
+System (Level B):
+
+- Single AXI4-Lite master (`picorv32_axi`, minimal RV32I) and a five-way address router with DECERR on unmapped addresses
+- Boots and runs from flash with no copy to RAM (XIP_CFG_RESET = 0x8001086B)
+- Provisioning logic that sets the flash Quad-Enable bit (WREN, WRSR, RDSR, RDID) and holds the CPU in reset until it is done
+- 8 KB RAM, 16-bit LED register, 16-bit four-digit hexadecimal seven-segment register
+- `clk` 100 MHz and `qclk` 50 MHz
 
 ---
 
-## Files
+# Part A: Core IP (qspi_axi_top)
 
-**New for this integration:**
+## A1. Architecture overview
 
-| File | Description |
+```
+ AXI4-Lite master
+        |
+  one AXI4-Lite slave port        (ACLK domain)
+     |            |
+ register block   read-only XIP window
+     |            |
+     +--- shared QSPI controller ---+      (qclk domain)
+              |
+   cs_n, io0..io3 (out / oe / in)  ->  flash
+```
+
+Writes go to the register block. Reads are steered by address to the register block or the XIP window. Both use the same flash interface.
+
+## A2. Core ports (qspi_axi_top)
+
+| Port | Dir | Width | Description |
+|---|---|---|---|
+| ACLK | in | 1 | AXI clock |
+| ARESETn | in | 1 | AXI-side reset, active low |
+| qclk | in | 1 | QSPI-side clock |
+| qclk_rst | in | 1 | QSPI-side reset, active high |
+| S_AXI_AWADDR | in | 32 | Write address |
+| S_AXI_AWVALID | in | 1 | Write address valid |
+| S_AXI_AWREADY | out | 1 | Write address ready |
+| S_AXI_WDATA | in | 32 | Write data |
+| S_AXI_WSTRB | in | 4 | Write byte strobes |
+| S_AXI_WVALID | in | 1 | Write data valid |
+| S_AXI_WREADY | out | 1 | Write data ready |
+| S_AXI_BRESP | out | 2 | Write response |
+| S_AXI_BVALID | out | 1 | Write response valid |
+| S_AXI_BREADY | in | 1 | Write response ready |
+| S_AXI_ARADDR | in | 32 | Read address |
+| S_AXI_ARVALID | in | 1 | Read address valid |
+| S_AXI_ARREADY | out | 1 | Read address ready |
+| S_AXI_RDATA | out | 32 | Read data |
+| S_AXI_RRESP | out | 2 | Read response |
+| S_AXI_RVALID | out | 1 | Read data valid |
+| S_AXI_RREADY | in | 1 | Read data ready |
+| cs_n | out | 1 | Flash chip select, active low |
+| io0_out - io3_out | out | 4 | Flash data line output values |
+| io0_oe - io3_oe | out | 4 | Flash data line output enables |
+| io0_in - io3_in | in | 4 | Flash data line input values |
+
+Flash SCLK is not a port of this core; the integrator derives it from `qclk`.
+
+## A3. Core parameters
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| TIMEOUT_CYCLES | 20'hFFFFF | qclk cycles a transaction may stay busy before the engine forces an abort and raises ERROR |
+| XIP_CFG_RESET | 32'h0 | Reset value of XIP_CFG. 0 keeps XIP disabled. The system overrides it to 0x8001086B |
+| XIP_BASE | 0x0100_0000 | XIP window base |
+| XIP_SIZE | 0x0100_0000 | XIP window size (16 MB) |
+
+## A4. AXI4-Lite behaviour
+
+**Write path.** Writes always go to the register block; the XIP window is read-only by design. AW and W are independent: the slave accepts either first or both together, and completes the register write on the cycle the second one arrives. BRESP is always OKAY. WSTRB is honoured per byte lane for every register.
+
+**Read path.** Reads are routed on the live `S_AXI_ARADDR`:
+
+| ARADDR | Target | Response |
+|---|---|---|
+| inside `[XIP_BASE, XIP_BASE + XIP_SIZE)` | XIP window | OKAY with data, or DECERR on a fetch error |
+| `0x00` to `0x1B` (offsets up to XIP_CFG plus one word) | register block | OKAY |
+| anything else | nobody (not forwarded) | DECERR on the next cycle, RDATA = 0 |
+
+The target is latched at the AR handshake and controls the R channel, so a newer pending address cannot misroute an older response. Only the latched target sees RREADY.
+
+**Register block read details.** A read of TX_DATA returns 0. A read of an address inside `0x00..0x1B` that is not a defined, aligned offset returns 0 with OKAY (see A6).
+
+**XIP response codes.** OKAY on success. DECERR (`2'b10`) when XIP is disabled, when the address is outside the window, or when the engine reports an error or aborts. The AR handshake is always accepted; the error is reported on R, never by withholding ARREADY.
+
+## A5. Register map
+
+| Offset | Name | Access | Notes |
+|---|---|---|---|
+| 0x00 | CTRL_CMD | RW | Transaction control (below). Writing start (bit 21) or ABORT (bit 23) pulses a strobe for one ACLK cycle. ABORT is not stored |
+| 0x04 | ADDR | RW | Flash address |
+| 0x08 | NUM_BYTES | RW | Transfer length; engine uses bits [11:0] only |
+| 0x0C | STATUS | RO plus W1C | Bits below |
+| 0x10 | TX_DATA | WO | Next byte to transmit (low 8 bits); reads return 0 |
+| 0x14 | RX_DATA | RO | Last received byte (low 8 bits) |
+| 0x18 | XIP_CFG | RW | XIP configuration (below); reset value = XIP_CFG_RESET |
+
+**CTRL_CMD** (writes are WSTRB-masked per byte):
+
+| Bits | Field | Notes |
+|---|---|---|
+| 7:0 | opcode | Always sent on one line, 8 cycles |
+| 9:8 | addr_lines | 0 single, 1 dual, 2 quad |
+| 11:10 | data_lines | 0 single, 1 dual, 2 quad |
+| 12 | addr_width | 0 = 24-bit, 1 = 32-bit |
+| 20:13 | dummy_cycles | 0 skips the DUMMY phase |
+| 21 | start | Strobe; ignored while the engine is busy |
+| 22 | dir | 0 read, 1 write |
+| 23 | ABORT | Strobe; cancels any phase immediately |
+
+**STATUS:**
+
+| Bit | Name | Behaviour |
+|---|---|---|
+| 0 | BUSY | Level; high while a transaction is in flight |
+| 1 | DONE | Set on normal completion only. Cleared by a new start or by writing 1 to this bit. Set wins over clear when both land on the same cycle |
+| 2 | TX_READY | Set when the engine asks for a byte; cleared by a write to TX_DATA |
+| 3 | RX_READY | Set when a byte is valid; cleared by a read of RX_DATA |
+| 4 | ERROR | Set on the rising edge of the engine's timeout error; cleared by a new start or by writing 1 to this bit |
+| 31:5 | reserved | Read 0 |
+
+**XIP_CFG:**
+
+| Bits | Field |
 |---|---|
-| `basys3_top.sv` | Top-level module. Wires every other module together into the complete system, and is the only file with real physical board pins as ports. |
-| `qe_provision.sv` | One-time flash setup routine. Runs before anything else, unlocking a feature the flash chip needs before it can be used the way this project needs it. |
-| `system_router.sv` | Address-based traffic director. The CPU has one bus port but four destinations; this module decides where each transaction actually goes. |
-| `sram.sv` | 8KB of on-chip Block RAM — the CPU's stack/scratch memory. |
-| `led_peripheral.sv` | A single register wired directly to the 16 LEDs. |
-| `seven_seg.sv` | Drives the 4-digit display. Unlike the LED peripheral, this one runs its own continuous internal refresh loop, independent of software. |
-| `led_chase.S` / `.bin` | The actual RISC-V program the CPU runs — assembly source and its compiled machine code. |
-| `basys3_top.xdc` | Physical constraints file — maps every logical signal in the design to a real, physical pin on the FPGA package. |
-| `picorv32.v` | The real, unmodified PicoRV32 core source (external — see the Theory section for what it can do). |
+| 31 | XIP_ENABLE (placed far from the other fields so it cannot overlap OPCODE) |
+| 20:13 | DUMMY_CYCLES |
+| 12 | ADDR_WIDTH |
+| 11:10 | DATA_LINES |
+| 9:8 | ADDR_LINES |
+| 7:0 | OPCODE |
 
-**The pre-existing QSPI flash controller IP** (built on top of, not
-modified — 9 files):
+System reset value 0x8001086B decodes to: enabled, opcode 0x6B, 24-bit address on one line, data on four lines, 8 dummy cycles.
 
-| File | Description |
+## A6. Design Behaviour
+
+These are the current behaviours. They are not necessarily intended; confirm each with the design owner.
+
+1. **Writes to the XIP window, to unmapped register offsets, and to any address the register block does not decode are accepted with BRESP OKAY and silently ignored.** Only reads get DECERR for invalid addresses. At system level a write inside the XIP window is routed to the QSPI core and behaves the same way; the router's DECERR applies only to addresses outside all five regions.
+2. **Misaligned or in-between addresses inside `0x00..0x1B`** (for example `0x01`) match no register case: reads return 0 with OKAY, writes are ignored with OKAY. No alignment check exists anywhere.
+3. **XIP reads are not alignment-checked.** `ARADDR = XIP_BASE + 1` fetches four bytes starting at flash address 1.
+4. **NUM_BYTES above 4095 is truncated** to its low 12 bits. A value of exactly 4096 runs as 0 bytes.
+5. **Writes to CTRL_CMD while a transaction is in flight** change the stored register but not the running transaction, because the engine latched its copy at start. A write that sets bit 21 while busy is ignored by the engine.
+6. **ABORT during an XIP fetch** ends that fetch with a DECERR on R.
+7. **The XIP window returns DECERR for controller errors**, not SLVERR.
+8. **A transaction that times out leaves ERROR set** in the engine until the next accepted start; the register-path STATUS.ERROR is sticky on top of that.
+9. **The existing test `numbytes_256_truncation` can never fail:** its check expression ends in `|| 1`. The 256-byte regression is therefore not actually protected by that test.
+
+## A7. Existing core tests
+
+All tests are directed and self-checking, and all pass.
+
+**Register-path suite (18)**
+
+| # | Test | What it checks |
+|---|---|---|
+| 1 | read_quad_1byte | 1-byte read, quad data lines |
+| 2 | read_single_1byte | 1-byte read, single data line |
+| 3 | read_dual_1byte | 1-byte read, dual data lines |
+| 4 | write_single_1byte | 1-byte write, single data line |
+| 5 | write_quad_1byte | 1-byte write, quad data lines |
+| 6 | read_quad_3byte_lastbyte | 3-byte read; last byte retrievable |
+| 7 | read_32bit_addr | 32-bit address mode |
+| 8 | read_dummy_zero | Zero dummy cycles; DUMMY phase skipped |
+| 9 | numbytes_256_truncation | 256-byte transfer (see A6 item 9) |
+| 10 | back_to_back_txns | Two transactions in a row |
+| 11 | start_while_busy_ignored | Start during a running transaction is a no-op |
+| 12 | sticky_done_bit | DONE stays set until cleared by writing 1 |
+| 13 | tx_rx_ready_visibility | TX_READY and RX_READY set and clear rules |
+| 14 | dual_line_address_phase | Address on dual lines |
+| 15 | quad_line_address_phase | Address on quad lines |
+| 16 | abort_midtransaction | ABORT stops a running transaction |
+| 17 | timeout_safety_net | Timeout sets ERROR and ends the transaction |
+| 18 | mixed_quad_addr_single_data | Quad address with single-line data |
+
+**XIP and shared-port suite (11)**
+
+| # | Test | What it checks |
+|---|---|---|
+| 1 | xip_disabled_reject | Fetch with XIP disabled returns DECERR |
+| 2 | xip_baseline_fetch | Normal fetch returns the expected word |
+| 3 | xip_out_of_range | Address outside the window returns DECERR |
+| 4 | shared_port_register_then_xip_read | Register access then XIP read on the one port |
+| 5 | abort_cuts_short_xip_transaction | ABORT during an XIP fetch |
+| 6 | xip_timeout_reports_error | Stalled fetch times out with DECERR |
+| 7 | register_path_recovers_after_xip_timeout | Register path works again after an XIP timeout |
+| 8 | xip_cfg_write_mid_flight_does_not_corrupt | XIP_CFG write during a fetch |
+| 9 | xip_dual_line_data_fetch | Fetch with dual data lines |
+| 10 | xip_quad_line_data_fetch | Fetch with quad data lines |
+| 11 | xip_back_to_back_fetches | Consecutive fetches |
+
+---
+
+# Part B: System (basys3_top)
+
+## B1. Boot stages
+
+1. Power-up: FPGA configures from flash (bitstream at 0x000000).
+2. The provisioning logic issues WREN (0x06), WRSR (0x01), RDSR (0x05) and RDID (0x9F) to set and check QE.
+3. When provisioning is done the CPU is released from reset.
+4. PicoRV32 fetches from PROGADDR_RESET = 0x0130_0000 (XIP window + 0x300000).
+5. The program drives the LED register and the seven-segment register.
+
+## B2. Architecture overview
+
+The CPU (`picorv32_axi`, core plus AXI adapter) is the only AXI4-Lite master. An address router forwards its accesses to one of: the QSPI core (register bank and XIP window through its single port), the LED register, the seven-segment register or the RAM. Addresses outside all five regions get DECERR from the router and are never forwarded. The QSPI core is Level A, unchanged.
+
+The provisioning logic shares the physical flash pins with the core and has exclusive control of them until it is done. The AXI side runs on `clk`; the QSPI controller, the provisioning logic and the flash SCLK run on `qclk`.
+
+## B3. Address map
+
+| Range | Slave |
 |---|---|
-| `qspi_axi_pkg.sv` | Shared constants — register offsets, bit positions — imported by several of the files below. Not a module itself, just a package. |
-| `pulse_sync.sv` | A single-bit clock-domain-crossing primitive — safely passes a one-cycle pulse from one clock domain to another. |
-| `cdc_bridge.sv` | Uses `pulse_sync.sv` to safely cross every control/data signal between the CPU's clock domain (`ACLK`) and the QSPI engine's own clock domain (`QCLK`). |
-| `qspi_engine.sv` | The actual QSPI shift engine — walks a transaction through its command/address/dummy/data phases and drives the real `io0`-`io3` pins. Has no knowledge of AXI at all. |
-| `qspi_arbiter.sv` | Since two different things can both want to use the QSPI engine (ordinary register access, and XIP fetches), this decides who gets it and keeps their responses from crossing wires. |
-| `axi4L_slave.sv` | The ordinary, register-based AXI4-Lite interface to the QSPI engine — control/status/data registers a CPU can read and write directly. |
-| `qspi_xip_slave.sv` | The memory-mapped, read-only interface — any AXI read landing in the XIP address range transparently becomes a real QSPI flash read. |
-| `qspi_unified_slave.sv` | Merges the register interface and the XIP interface into one single external AXI4-Lite port, since PicoRV32 only has one bus port to offer. |
-| `qspi_axi_top.sv` | The wrapper tying all 8 files above together into one module — this is what `basys3_top.sv` actually instantiates. |
+| 0x0000_0000 - 0x0000_001B | QSPI register bank |
+| 0x0100_0000 - 0x01FF_FFFF | QSPI XIP window (read-only) |
+| 0x0200_0000 - 0x0200_0003 | LED register (16 bits) |
+| 0x0300_0000 - 0x0300_0003 | Seven-segment register (16 bits, four hex digits) |
+| 0x1000_0000 - 0x1000_1FFF | 8 KB RAM |
+| anything else | DECERR |
+
+LED register: 16 bits, WSTRB[1:0] write the two bytes, WSTRB[3:2] ignored. Seven-segment register: 16 bits, WSTRB[1:0] only; MSB nibble on `an[3]`; active-low anodes and segments; own refresh divider of 2^15 clk cycles per digit (about 328 us).
+
+## B4. Top-level ports (basys3_top)
+
+| Port | Dir | Width | Description |
+|---|---|---|---|
+| clk | in | 1 | 100 MHz board oscillator |
+| btn_reset | in | 1 | BTNC, active high; inverted internally to resetn |
+| cs_n | out | 1 | Flash chip select |
+| io0 - io3 | inout | 4 | Flash data lines (tristate at the pad) |
+| led | out | 16 | Onboard LEDs |
+| seg | out | 7 | Seven-segment cathodes, active low |
+| dp | out | 1 | Decimal point (off) |
+| an | out | 4 | Digit anodes, active low, one-hot |
+
+Flash SCLK is not a top-level port; it is driven through the device's dedicated configuration clock.
+
+## B5. System parameters
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| QSPI_XIP_BASE | 0x0100_0000 | XIP window base |
+| QSPI_XIP_SIZE | 0x0100_0000 | XIP window size |
+| QSPI_TIMEOUT_CYCLES | 0xFFFFF | Engine timeout before STATUS.ERROR |
+| RAM_BASE_ADDR | 0x1000_0000 | RAM base |
+| RAM_DEPTH_WORDS | 2048 | 8 KB |
+| USER_PROGRAM_FLASH_OFFSET | 0x0030_0000 | Program offset in flash; simulation overrides to 0 |
+
+## B6. Design goals
+
+- Run code from flash with no copy to RAM
+- Keep the AXI4-Lite fabric minimal and fully decoded, with explicit error responses
+- Make flash bring-up self-contained (no external programmer step to set QE)
+- Provide a reproducible simulation flow with no vendor-tool dependency
+
+## B7. Supported configuration
+
+- CPU: RV32I, no compressed, no multiply/divide, no interrupts
+- Flash: MX25L3233F, 4 MB, JEDEC ID 0xC2, single-line command and address, quad data
+- Flash layout: bitstream at 0x000000, program at 0x300000
+- Other flash devices are not characterized
+
+## B8. Challenges
+
+- A flash with QE unset ignores quad reads, so the CPU must not start before provisioning is done
+- The provisioning logic must run on `qclk`; running it on `clk` was a past regression
+- Safe crossing between the 100 MHz AXI domain and the 50 MHz engine
+- Flash command set and timing are only modelled, not exhaustively, in simulation
 
 ---
 
-## Architecture
+# Integration and Simulation
+
+**Reset and clocks.** Level A has two independent resets: `ARESETn` (active low) and `qclk_rst` (active high). Both should be applied together. Level B holds the CPU in reset until flash provisioning is done.
+
+**Access contract.** The XIP window is read-only. Writes to it, and to unmapped register offsets, return OKAY and are ignored (A6 item 1). Reads that hit neither a register nor the window return DECERR. At system level, addresses outside all five regions return DECERR for both reads and writes. STATUS DONE and ERROR are sticky and cleared by writing 1.
+
+**Simulation.** Icarus Verilog 12 with `-g2012`. The Xilinx STARTUPE2 primitive is replaced by a stub model in simulation. Existing results:
 
 ```
-                Basys 3 board (physical pins)
-                             │
-             ┌────────────────────────────────────────────┐
-             │            basys3_top.sv                   │
-             │                                            │
-QSPI flash ──┤  qe_provision.sv                           │
-             │  (runs first: unlocks flash quad           │
-             │   mode, then releases everything           │
-             │   else)                                    │
-             │                                            │
-             │      ┌── system_router.sv ──┐              │
-             │      │  (1 CPU port,        │              │
-             │CPU ──┤   4 destinations)    │              │
-             │(PicoRV32)                   │              │
-             │      └──┬────┬────┬────┬────┘              │
-             │         ▼    ▼    ▼    ▼                   │
-             │      qspi_ sram led_  seven_               │
-             │      axi_  .sv  periph seg                 │
-             │      top  (RAM) .sv   .sv                  │
-             │      .sv        (LEDs)(display)            │
-             └────────────────────────────────────────────┘
-```
-
-Every peripheral sits behind the same kind of interface (AXI4-Lite —
-see theory below), which is exactly what lets `system_router.sv` treat
-them uniformly: it doesn't need to know *what* a peripheral does, only
-*which address range* it owns.
-
-### Inside `qspi_axi_top.sv` — the pre-existing IP's own internal structure
-
-The main diagram above shows `qspi_axi_top.sv` as one block. Internally,
-it's actually 9 separate files with a real, specific topology:
-
-```
-        Single AXI4-Lite port (from system_router.sv)
-                          │
-                          ▼
-              qspi_unified_slave.sv
-     (routes by address: register range → left,
-              XIP range → right)
-                 │                 │
-                 ▼                 ▼
-        axi4L_slave.sv     qspi_xip_slave.sv
-        (register-based     (memory-mapped,
-         read/write)          read-only XIP)
-                 │                 │
-                 └────────┬────────┘
-                          ▼
-                  qspi_arbiter.sv
-       (only one of the two above can use the
-              engine at any moment)
-                          │
-                          ▼
-                   cdc_bridge.sv
-       (crosses from ACLK's clock domain into
-        QCLK's — uses pulse_sync.sv internally)
-                          │
-                          ▼
-                   qspi_engine.sv
-         (drives the real io0-io3 pins directly)
-
-  qspi_axi_pkg.sv: shared constants (register
-  offsets, bit positions) imported by several
-  of the modules above — not part of the flow
-  itself, just a shared definitions file.
+system test:        14 pass, 0 fail
+register-path test: 18 pass, 0 fail
+XIP test:           11 pass, 0 fail
+RAM test:            7 pass, 0 fail
 ```
 
 ---
 
-## Theory
+# Verification
 
-### RISC-V, and the "types of instruction sets"
+## Known regressions
 
-RISC-V is an open instruction set architecture — the actual vocabulary
-of instructions a CPU understands, openly published with no licensing
-fees, which is why free cores like PicoRV32 exist at all.
-
-RISC-V is deliberately modular. There's a small mandatory **base**
-integer set, plus optional **extensions** a specific chip may or may
-not include:
-
-| Extension | Adds |
+| Bug | Symptom |
 |---|---|
-| **I** (base, mandatory) | Integer arithmetic, loads/stores, branches — the minimum needed to run real software |
-| **M** | Hardware multiply/divide |
-| **A** | Atomic memory operations (for multi-core synchronization) |
-| **F** / **D** | Single/double-precision floating point |
-| **C** | Compressed 16-bit instruction encodings (smaller code size) |
-
-**This project uses RV32I only** — the plain base set, nothing else.
-PicoRV32 is explicitly configured with every extension disabled
-(`ENABLE_MUL=0`, `ENABLE_DIV=0`, `COMPRESSED_ISA=0`). This means, for
-example, there's no hardware multiply instruction available at all —
-which is exactly why the current program only ever adds and subtracts.
-
-### AXI4-Lite
-
-The on-chip bus protocol connecting the CPU to every peripheral. A
-simplified version of ARM's AXI4 standard, using five independent
-channels for any single transaction:
-
-- **AW** — write address
-- **W** — write data
-- **B** — write response (did it succeed?)
-- **AR** — read address
-- **R** — read data + response
-
-Every peripheral in this design — flash controller, RAM, LEDs, display
-— speaks this exact same protocol, which is what makes uniform routing
-possible in the first place.
-
-### QSPI
-
-Serial Peripheral Interface using **4 data lines simultaneously**
-(Quad SPI) instead of the usual 1, for roughly 4x the transfer rate at
-the same clock speed. The flash chip on this board communicates over
-QSPI once configured correctly (see the QE-bit discussion in the bug
-list below — quad mode isn't available by default).
-
-### XIP (execute-in-place)
-
-The core technique this whole project demonstrates: fetching CPU
-instructions **directly from flash**, live, one at a time, rather than
-copying the program into RAM first. A dedicated address range
-(`0x0100_0000`–`0x01FF_FFFF`) is reserved specifically for this — any
-read in that range is silently redirected into a real QSPI flash
-transaction instead of touching any actual memory.
-
-### PicoRV32 — what the core can actually do
-
-This project uses only a small slice of PicoRV32's real capabilities.
-Source: [github.com/YosysHQ/picorv32](https://github.com/YosysHQ/picorv32).
-
-PicoRV32 is explicitly designed as a **size-optimized** CPU — small
-footprint, high achievable clock frequency, meant to be dropped into
-FPGA or ASIC designs as an auxiliary processor rather than a
-high-performance main CPU. It trades raw speed for size: average
-throughput is roughly 4-5 clock cycles per instruction, not 1.
-
-**ISA configurability** — depending on which parameters are enabled, the
-exact same core can be built as RV32E (a reduced 16-register variant for
-extremely small designs), RV32I (what this project uses), RV32IC
-(adding compressed 16-bit instructions), RV32IM (adding hardware
-multiply/divide), or the full RV32IMC.
-
-**Three separate bus interface variants** — the same core logic can be
-wrapped with different external interfaces depending on what it needs
-to talk to:
-- **Native memory interface** — the simplest option, for small,
-  self-contained systems
-- **`picorv32_axi`** — an AXI4-Lite master interface (what this project
-  uses)
-- **`picorv32_wb`** — a Wishbone master interface, a different, simpler
-  open bus standard
-
-**IRQ (interrupt) support** — lets the CPU react to external events
-without needing to poll for them, implement fault handlers, or even
-emulate instructions from a larger instruction set entirely in
-software. Fully disabled in this project (`ENABLE_IRQ=0`).
-
-**PCPI (Pico Co-Processor Interface)** — a genuinely distinctive
-feature: lets you implement entirely custom, non-branching instructions
-via an external co-processor module, effectively extending the
-instruction set with your own hardware. Not used here, but this is
-exactly the mechanism PicoRV32's own optional hardware multiply/divide
-units are built on top of internally.
-
-**Built-in fault detection** — `CATCH_MISALIGN` and `CATCH_ILLINSN`
-(both enabled by default) are what actually produce the `trap` signal
-this project's bring-up relied on heavily as a diagnostic — PicoRV32
-halting itself cleanly the moment it's fed a genuinely invalid
-instruction, rather than doing something unpredictable.
-
-**Execution trace and cycle counters** — optional built-in debug/
-profiling output (`ENABLE_TRACE`, `ENABLE_COUNTERS`), not used in this
-project.
-
-**Configurable performance/area tradeoffs** — parameters like
-`BARREL_SHIFTER`, `TWO_CYCLE_ALU`, and `TWO_CYCLE_COMPARE` let the same
-core be tuned toward either smaller area or faster execution, depending
-on what a specific design needs.
-
-### `STARTUPE2`
-
-A Xilinx-specific hardware primitive, required because of a real
-physical constraint on this board: the flash chip's clock pin isn't
-wired to an ordinary FPGA I/O pin at all — it's wired to the FPGA's own
-**dedicated configuration clock** pin, the same one used to load the
-bitstream at power-on. `STARTUPE2` is the only way to reach that pin
-after configuration has finished, and this project uses it specifically
-to drive the flash chip's clock during normal operation.
-
----
-
-## File-by-file breakdown
-
-### `basys3_top.sv`
-The only file with real physical pins (`clk`, `btn_reset`, `led`,
-`seg`/`dp`/`an`, `cs_n`, `io0`-`io3`). Contains the clock divider
-(`clk_div2`/`qclk` — halves the 100MHz system clock to 50MHz for the
-QSPI/flash side), the reset sequencing logic (`resetn` from the button,
-`resetn_main` which additionally waits for `qe_provision` to finish),
-and instantiates every other module.
-
-### `qe_provision.sv`
-**Ports**: `clk`, `resetn`, `done` (output — gates the rest of the
-system), `sr_readback`/`jedec_id` (diagnostic outputs, real chip
-responses), plus the raw QSPI pins it controls directly.
-**Key internals**: a state machine (`state`, values `S_IDLE` through
-`S_DONE`) stepping through `WREN` → `WRSR` → `RDSR` → `RDID` in
-sequence, a `shift_reg` used to serialize each outgoing command bit by
-bit, and `bit_cnt`/`gap_cnt` tracking progress through each command.
-
-### `system_router.sv`
-**Key internals**: a `decode()` function that takes an address and
-returns which of four destinations (`DEST_QSPI`, `DEST_LED`,
-`DEST_RAM`, `DEST_SEG`) it belongs to, plus `DEST_INVALID` for anything
-else (which gets an error response, not silent garbage). Separate
-latched `write_target`/`read_target` registers track, per in-flight
-transaction, which destination's response should actually be forwarded
-back to the CPU.
-
-### `sram.sv`
-A plain 8KB memory array (`DEPTH_WORDS` parameter, default 2048 × 32-bit
-words), split into 4 separate byte-wide arrays internally — a specific
-coding style required for Xilinx's tools to correctly recognize it as
-real Block RAM rather than accidentally building it out of thousands of
-individual flip-flops.
-
-### `led_peripheral.sv`
-The simplest peripheral in the design: one `led_reg` register, written
-by an ordinary AXI write, wired directly to the physical LED output.
-
-### `seven_seg.sv`
-**Key internals**: `display_reg` (the value to show), a `refresh_cnt`
-counter driving `active_digit` (cycles 0-3, selecting which of the 4
-digits is currently lit), and a hex-to-segment lookup (`case` statement
-mapping each 4-bit value 0-F to the correct pattern of lit segments).
-Both the digit-select and segment signals are active-low on this board
-specifically (confirmed against Digilent's own documentation).
-
-### `qspi_axi_pkg.sv`
-Not a module — a shared package. Defines register offsets
-(`REG_CTRL_CMD`, `REG_ADDR`, `REG_NUM_BYTES`, `REG_STATUS`,
-`REG_TX_DATA`, etc.) as named constants, imported by several of the
-files below so none of them have to hardcode raw addresses.
-
-### `pulse_sync.sv`
-A single-bit clock-domain-crossing primitive. Safely passes a one-cycle
-pulse from a source clock domain to a destination clock domain, used
-internally by `cdc_bridge.sv`.
-
-### `cdc_bridge.sv`
-Since the CPU/AXI side runs on `ACLK` and the QSPI engine runs on its
-own, independent `QCLK`, every signal crossing between them needs
-careful handling — this module does that crossing, using `pulse_sync.sv`
-for control pulses and standard synchronizer logic for level signals.
-
-### `qspi_engine.sv`
-The actual QSPI shift engine. Walks a transaction through command,
-address, dummy, and data phases, driving and sampling the real `io0`-
-`io3` pins directly. Has no concept of AXI at all — it only knows about
-a simple control/status interface, already crossed into its own clock
-domain by `cdc_bridge.sv`.
-
-### `qspi_arbiter.sv`
-Two different things can want to use the QSPI engine at once — an
-ordinary register-based request, or an XIP fetch. This module decides
-who actually gets it at any given moment, and makes sure each side only
-ever sees its own completion.
-
-### `axi4L_slave.sv`
-The register-based AXI4-Lite interface — control/status/data registers
-a CPU can read and write directly for ordinary (non-XIP) flash access.
-
-### `qspi_xip_slave.sv`
-The memory-mapped, read-only interface. Any AXI read landing in the XIP
-address range transparently becomes a real QSPI flash read, with no
-register writes or polling involved from the requester's side.
-
-### `qspi_unified_slave.sv`
-Merges `axi4L_slave.sv`'s register interface and `qspi_xip_slave.sv`'s
-XIP interface into one single external AXI4-Lite port — built
-specifically because PicoRV32 only has one bus master port to offer,
-not separate instruction/data buses.
-
-### `qspi_axi_top.sv`
-The top-level wrapper tying all 8 files above together — this is the
-one module `basys3_top.sv` actually instantiates directly.
-
-### `picorv32.v`
-The real, unmodified PicoRV32 core source (external, not written for
-this project — see the Theory section above for its full capabilities).
-`basys3_top.sv` specifically instantiates the `picorv32_axi` variant
-from within this file.
-
-### `led_chase.S`
-The actual program. Uses registers `t1` (LED peripheral address),
-`t5` (seven-segment address), `t0`/`t4` (the growing LED bit-pattern),
-`t6` (the independent hex counter). Structure:
-- `_start` — one-time setup (load addresses, zero the counter)
-- `restart_pattern` — resets just the LED pattern (not the counter) each time all 16 LEDs fill up
-- `fill_loop` — the main loop: add the next LED bit, write LEDs, increment the counter, write the display, delay, repeat
-- `delay` — a plain decrement-and-branch busy-wait; the single constant here controls the entire step rate
-
----
-
-## Flow diagram (files + functions)
-
-```
- POWER ON
-    │
-    ▼
- [Xilinx config logic] reads .bit from flash @ 0x000000
-    │  (basys3_top.sv now physically exists as a circuit)
-    ▼
- qe_provision.sv :: state machine
-    S_IDLE → WREN → WRSR → RDSR → RDID → S_DONE
-    │  (sets done=1)
-    ▼
- basys3_top.sv :: resetn_main releases
-    │  (PicoRV32, system_router, all peripherals start)
-    ▼
- PicoRV32 :: fetch @ PROGADDR_RESET (0x0130_0000)
-    │
-    ▼
- qspi_axi_top.sv (qspi_xip_slave) :: address → flash offset 0x300000
-    │  (real QSPI read transaction fires)
-    ▼
- led_chase.S :: _start → restart_pattern → fill_loop
-    │
-    ├─► sw t0, LED_ADDR ──► system_router.decode() ──► led_peripheral.sv ──► LEDs
-    │
-    └─► sw t6, SEG_ADDR  ──► system_router.decode() ──► seven_seg.sv ──► display
-    │
-    ▼
- delay loop ──► slli/blt (next LED bit, or restart_pattern) ──► [back to fill_loop]
-```
-
----
-
-## Bugs found and fixed
-
-Real issues found and resolved during this project, in roughly the
-order encountered:
-
-- **Stale synthesis results** — Vivado silently reused an old
-  synthesized netlist across multiple RTL changes; every test appeared
-  to fail identically regardless of what was actually changed, until a
-  full `Reset Run` forced genuine resynthesis.
-- **LED pin typo** — one LED constraint pointed at the wrong physical
-  pin; found by checking against Digilent's actual official constraints
-  file rather than a secondary source.
-- **Bidirectional pin conflict** — two separate logical ports
-  (`io0_out`/`io0_in`) were mistakenly constrained to the same physical
-  pin; Vivado does not merge these automatically. Fixed with a real
-  `inout` port and explicit tristate logic.
-- **Boot mode jumper** — the board defaults to JTAG boot mode; nothing
-  loads from flash at all until this physical jumper is moved to QSPI
-  mode.
-- **SPI bus-width mismatch** — the bitstream itself specifies 4-bit
-  (quad) configuration mode; attempting to *write* the flash using
-  single-line mode was rejected outright.
-- **QE bit not set by default** — quad-mode flash access silently
-  returns garbage until the chip's Quad Enable bit is explicitly set;
-  not handled automatically by Vivado's flash-programming flow as
-  general documentation suggested.
-- **Clock-domain bug — the actual root cause of extended debugging**:
-  `qe_provision` was accidentally clocked from the 100MHz system clock
-  instead of the 50MHz clock genuinely reaching the physical flash pin.
-  This silently scrambled every command it sent, despite the command
-  sequence itself being correct — invisible to code review alone,
-  since the logic really was correct, just running on the wrong clock.
-- **RISC-V register naming mistake** — early assembly code referenced
-  `t7`/`t8`/`t9`, which don't exist in RISC-V (`t0`-`t6` is the full
-  range); caught immediately by the assembler.
-- **Simulation model gaps** — the behavioral flash model used for
-  simulation had never been built to handle the specific commands
-  `qe_provision` needed (`WREN`/`WRSR`/etc.), since nothing had used
-  them before; extended to handle them without corrupting other tests.
-
----
-
-## Vivado project setup — which file goes where
-
-Vivado separates sources into three distinct categories. Getting a file
-into the wrong one is a common, confusing mistake — here's the complete,
-correct placement for every file in this project.
-
-### Design Sources (synthesizable RTL — becomes real hardware)
-
-```
-qspi_axi_pkg.sv
-pulse_sync.sv
-cdc_bridge.sv
-axi4L_slave.sv
-qspi_engine.sv
-qspi_arbiter.sv
-qspi_xip_slave.sv
-qspi_unified_slave.sv
-qspi_axi_top.sv
-led_peripheral.sv
-sram.sv
-seven_seg.sv
-system_router.sv
-qe_provision.sv
-basys3_top.sv        ← set as Top Module
-picorv32.v            (real, external PicoRV32 source)
-```
-
-### Constraints
-
-```
-basys3_top.xdc
-```
-
-### Simulation Sources (never synthesized — testbench only)
-
-```
-qspi_flash_model.sv
-tb_basys3_top.sv      ← set as simulation Top Module
-led_chase_*.mem        (whichever program the testbench currently
-                         references via its $readmemh call)
-```
-
-### Not part of the Vivado project at all
-
-```
-led_chase.bin
-```
-This never gets added to any Vivado source category — it's used
-entirely outside the project, fed directly into the memory
-configuration file generation step below (as the "Datafile" at
-address `0x300000`).
-
----
-
-## Generating the memory configuration file
-
-The `.bit` file (FPGA configuration) and the compiled program (`.bin`)
-are two separate files that need to be merged into one, with each
-placed at its correct address in the flash chip's memory map, before
-either can be written to the physical flash.
-
-Vivado's **Tools → Generate Memory Configuration File** does this:
-
-- **Format**: `MCS`
-- **Load bitstream files**, start address `00000000` → the project's
-  `.bit` file (from `<project>.runs/impl_1/`)
-- **Load data files**, start address `00300000` → the compiled program
-  (`led_chase.bin`)
-- **Interface**: `SPIx4` — must match `CONFIG_MODE SPIx4` in the XDC
-  file, or generation fails with a bus-width mismatch error
-
-This produces a single combined `.mcs` file containing both pieces at
-their correct offsets.
-
-<img width="1848" height="1401" alt="Screenshot 2026-08-21 200021" src="https://github.com/user-attachments/assets/4375868c-d7e7-4e9f-aeb3-811e878b51de" />
-
-
-## Uploading to the board
-
-With the board connected and powered on:
-
-1. **Hardware Manager → Open Target → Auto Connect**
-2. **Right-click the connected device → Program Configuration Memory
-   Device**
-3. Point "Configuration file" at the `.mcs` file generated above
-4. Confirm **Erase**, **Program**, and **Verify** are checked
-5. Click OK and wait for programming to complete (this writes to the
-   physical flash chip, noticeably slower than a direct FPGA load — a
-   few minutes, not seconds)
-6. **Power-cycle the board** (required — this is what triggers the FPGA
-   to actually reconfigure itself from flash, not just leave the
-   previous session running)
-7. Confirm the **DONE** LED lights, confirming successful
-   reconfiguration from flash
-
-<img width="2128" height="1492" alt="Screenshot 2026-08-21 200147" src="https://github.com/user-attachments/assets/45bc6cd0-86a0-4121-92cd-9d82f6094ae9" />
-
-
-## Demonstration video
-
-
-
-https://github.com/user-attachments/assets/15a157cc-c874-452b-96f8-4964fe701dfb
-
-
-
----
-
-## Testing and future scope
-
-### How this was tested
-
-Verified in two stages: first in simulation (a full-system testbench
-exercising the complete boot sequence, XIP fetch, and peripheral
-writes against a behavioral flash model), then confirmed directly on
-the physical board — reading the flash chip's real manufacturer ID
-back (`0xC2`, genuine Macronix), confirming the QE bit was genuinely
-set via direct register readback, confirming the CPU never crashed on
-its first real instruction fetch, and visually confirming correct,
-continuous LED and seven-segment behavior.
-
-### Future scope
-
-- **Real input** — currently the CPU can only write to peripherals, never
-  read from anything external. Adding a button/switch input peripheral
-  would let the program actually react to the outside world, opening
-  the door to interactive behavior (a simple calculator using the
-  buttons/switches has been discussed as a concrete next demo).
-- **Hardware multiply/divide** — enabling PicoRV32's `M` extension would
-  allow real arithmetic beyond add/subtract without needing slower
-  software workarounds.
-- **Decimal display mode** — a BCD-based decimal counter (rather than
-  the current hexadecimal one) has already been built and verified in
-  simulation, available as a drop-in alternative if wanted later.
-- **UART** — using the board's built-in USB-UART bridge to send/receive
-  real text to a PC terminal.
-- **Larger programs** — the current program is tiny by design; nothing
-  about the architecture limits program size beyond the flash chip's own
-  capacity.
+| Provisioning logic on wrong clock | JEDEC ID read 0x00, QE never set, first XIP fetch returned garbage and CPU trapped |
+| RX nibble loss | Received data dropped a nibble at a timing boundary |
+| TX byte 0 lost | First transmitted byte missing |
+| Line masking | Wrong data lines driven or sampled in single and dual modes |
+| NUM_BYTES = 256 truncated | 256-byte transfer ran as 0 |
+| STATUS not sticky | DONE and ERROR lost before software read them |
+| Stale error carried into a new XIP request | New fetch reported the previous transaction's error |
+| Final byte lost when busy dropped early | Last rx_valid pulse discarded or misrouted |
+| Fast error path re-accepted lingering ARVALID | Phantom second XIP request |
+| Invalid address on the shared port returned 0 with OKAY | Garbage data with no error |
+
+## Project status
+
+**Hardware-validated.** The design, directed testbenches, board image and documentation are present. On the Basys 3 the JEDEC ID reads 0xC2, QE sets, the CPU runs without trapping, and LEDs and display behave correctly. All four testbenches pass.
+
+Not yet covered, for DV to address:
+
+- Verification beyond the directed checks in A7 (verification plan, assertions and environment are left to DV)
+- The seven-segment register, router DECERR path, LED register and the provisioning failure path have no dedicated tests
+- The system test checks `led[13:0]` only
+- Flash model fidelity for WREN, WRSR, RDSR, RDID and dual mode is undocumented
+- No utilization or timing report exists for the final build (earlier pre-seven-segment build: 1397 LUT, 1105 FF, 2 BRAM tiles)
+- The reason the flash clock is inverted relative to `qclk` is to be confirmed with the design owner
+- The behaviours in A6 need an owner decision: intended or to be changed
+
+## Future roadmap
+
+- Directed tests for the uncovered blocks above
+- Randomized and formal verification of address decode, arbitration and clock crossing
+- Timing and utilization characterization of the final build
+- Automated simulation and lint flow
+- Possible features: burst or continuous-read XIP (needs a mode-bits phase in the QSPI controller), error responses for writes to the XIP window

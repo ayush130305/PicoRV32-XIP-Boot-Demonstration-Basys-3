@@ -1,0 +1,12 @@
+===================================
+Configuration Memory information
+===================================
+File Format        MCS
+Interface          SPIX4
+Size               4M
+Start Address      0x00000000
+End Address        0x003FFFFF
+
+Addr1         Addr2         Date                    File(s)
+0x00000000    0x0006781F    Aug 20 11:44:04 2026    C:/vivado_test/XIP-QSPI AXI Peripheral/XIP-QSPI AXI Peripheral.runs/impl_1/basys3_top.bit
+0x00300000    0x00300043    Aug 20 11:32:09 2026    C:/vivado_test/XIP-QSPI AXI Peripheral/led_chase_counter.bin

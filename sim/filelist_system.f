@@ -1,0 +1,17 @@
+startupe2_sim_model.sv
+../rtl/qspi/qspi_axi_pkg.sv
+../rtl/cdc/pulse_sync.sv
+../rtl/cdc/cdc_bridge.sv
+../rtl/qspi/qspi_engine.sv
+../rtl/qspi/qspi_arbiter.sv
+../rtl/axi/axi4L_slave.sv
+../rtl/xip/qspi_xip_slave.sv
+../rtl/axi/qspi_unified_slave.sv
+../rtl/qspi_axi_top.sv
+../rtl/system/qe_provision.sv
+../rtl/system/sram.sv
+../rtl/system/led_peripheral.sv
+../rtl/system/seven_seg.sv
+../rtl/system/system_router.sv
+../rtl/cpu/picorv32.v
+../rtl/system/basys3_top.sv

@@ -1,1 +1,4 @@
-*.mcs
+sim/build/
+*.vvp
+*.vcd
+*.elf

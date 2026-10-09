@@ -63,7 +63,14 @@ module basys3_top #(
   inout wire io0, io1, io2, io3,
 
   // Onboard LEDs - the demonstration's observable output
-  output logic [15:0] led
+  output logic [15:0] led,
+
+  // Onboard 4-digit seven-segment display - active-low, confirmed
+  // against Digilent's own reference manual and master XDC (not the
+  // generic textbook active-high-anode convention).
+  output logic [6:0]  seg,
+  output logic        dp,
+  output logic [3:0]  an
 );
 
   // Internal wiring: qspi_axi_top's own QSPI pins - kept separate from
@@ -155,8 +162,55 @@ module basys3_top #(
   logic [7:0] qe_sr_readback;
   logic [23:0] qe_jedec_id;
 
+
+  // ====================================================================
+  // CLOCK GENERATION LOGIC 
+  // (Moved up so qclk is declared before it is used by ILA and modules)
+  // ====================================================================
+
+  // Single clock domain for this whole top level, EXCEPT the physical
+  // flash clock itself - see the STARTUPE2 note below. ACLK and qclk
+  // are the SAME logical clock driving all internal FSMs (a deliberate
+  // simplification for this first bring-up; a future revision could
+  // give the QSPI engine its own truly independent clock via an MMCM).
+  logic clk_div2;
+  always_ff @(posedge clk or negedge resetn) begin
+    if (!resetn) clk_div2 <= 1'b0;
+    else         clk_div2 <= ~clk_div2;
+  end
+
+  logic qclk;
+  logic qclk_rst;
+  assign qclk     = clk_div2; // 50MHz
+  assign qclk_rst = ~resetn;
+
+
+  // ====================================================================
+  // ILA DEBUG MARKERS & MODULE INSTANTIATIONS
+  // ====================================================================
+
+  // ILA debug markers - added specifically to directly observe real
+  // signal timing during qe_provision's sequence, after multiple rounds
+  // of LED-based diagnostics couldn't conclusively determine whether a
+  // genuine timing bug exists. Vivado auto-inserts an ILA core during
+  // synthesis for any signal marked this way - no manual IP
+  // instantiation needed. Sampling clock is `clk` (100MHz, 2x qclk's
+  // rate) for finer granularity on the qclk transitions themselves.
+  (* mark_debug = "true" *) logic dbg_cs_n;
+  (* mark_debug = "true" *) logic dbg_io0_out;
+  (* mark_debug = "true" *) logic dbg_io0_in;
+  (* mark_debug = "true" *) logic dbg_io1_in;
+  (* mark_debug = "true" *) logic dbg_qclk;
+  (* mark_debug = "true" *) logic dbg_qe_done;
+  assign dbg_cs_n    = qe_cs_n;
+  assign dbg_io0_out = qe_io0_out;
+  assign dbg_io0_in  = qe_io0_in;
+  assign dbg_io1_in  = qe_io1_in;
+  assign dbg_qclk    = qclk;
+  assign dbg_qe_done = qe_done;
+
   qe_provision u_qe_provision (
-    .clk    (clk),
+    .clk    (qclk),
     .resetn (resetn),
     .done   (qe_done),
     .sr_readback (qe_sr_readback),
@@ -169,37 +223,6 @@ module basys3_top #(
     .io3_out(qe_io3_out), .io3_oe(qe_io3_oe)
   );
 
-  // Single clock domain for this whole top level, EXCEPT the physical
-
-  // flash clock itself - see the STARTUPE2 note below. ACLK and qclk
-  // are the SAME logical clock driving all internal FSMs (a deliberate
-  // simplification for this first bring-up; a future revision could
-  // give the QSPI engine its own truly independent clock via an MMCM).
-  //
-  // IMPORTANT, found during physical bring-up planning (not caught
-  // earlier, since simulation never needed a real physical clock pin
-  // at all - the behavioral flash model just shares the same wire):
-  // Basys 3's flash chip SCLK pin is wired to the FPGA's DEDICATED
-  // configuration clock pin (CCLK), which per Xilinx 7-series devices
-  // and Digilent's own official constraints file CANNOT be reached via
-  // an ordinary I/O pin at all - it is only accessible through the
-  // STARTUPE2 primitive's USRCCLKO port. Without this, the flash chip
-  // would never receive a single clock edge on real hardware, no matter
-  // how correctly cs_n/io0-io3 were pin-constrained. qclk is derived
-  // here as a divided 50MHz clock (100MHz/2) rather than run at full
-  // system clock speed, since STARTUPE2-routed CCLK has a documented
-  // practical ceiling around that rate on this class of board.
-  logic clk_div2;
-  always_ff @(posedge clk or negedge resetn) begin
-    if (!resetn) clk_div2 <= 1'b0;
-    else         clk_div2 <= ~clk_div2;
-  end
-
-  logic qclk;
-  logic qclk_rst;
-  assign qclk     = clk_div2; // 50MHz
-  assign qclk_rst = ~resetn;
-
   STARTUPE2 #(
     .PROG_USR("FALSE")
   ) u_startupe2 (
@@ -208,7 +231,7 @@ module basys3_top #(
     .GTS      (1'b0),
     .KEYCLEARB(1'b1),
     .PACK     (1'b0),
-    .USRCCLKO (qclk),  // the actual, real drive to the flash chip's SCLK
+    .USRCCLKO (~qclk),  // the actual, real drive to the flash chip's SCLK (INVERTED)
     .USRCCLKTS(1'b0),  // 0 = actively drive USRCCLKO, not 3-stated
     .USRDONEO (1'b1),
     .USRDONETS(1'b1),
@@ -366,6 +389,20 @@ module basys3_top #(
   logic [1:0]  ram_rresp;
   logic        ram_rvalid, ram_rready;
 
+  // ---- Router outputs to seven-segment display peripheral ----
+  logic [31:0] seg_awaddr;
+  logic        seg_awvalid, seg_awready;
+  logic [31:0] seg_wdata;
+  logic [3:0]  seg_wstrb;
+  logic        seg_wvalid, seg_wready;
+  logic [1:0]  seg_bresp;
+  logic        seg_bvalid, seg_bready;
+  logic [31:0] seg_araddr;
+  logic        seg_arvalid, seg_arready;
+  logic [31:0] seg_rdata;
+  logic [1:0]  seg_rresp;
+  logic        seg_rvalid, seg_rready;
+
   system_router #(
     .QSPI_XIP_BASE (QSPI_XIP_BASE),
     .QSPI_XIP_SIZE (QSPI_XIP_SIZE),
@@ -410,7 +447,13 @@ module basys3_top #(
     .RAM_WDATA   (ram_wdata),   .RAM_WSTRB   (ram_wstrb),    .RAM_WVALID  (ram_wvalid), .RAM_WREADY(ram_wready),
     .RAM_BRESP   (ram_bresp),   .RAM_BVALID  (ram_bvalid),   .RAM_BREADY  (ram_bready),
     .RAM_ARADDR  (ram_araddr),  .RAM_ARVALID (ram_arvalid),  .RAM_ARREADY (ram_arready),
-    .RAM_RDATA   (ram_rdata),   .RAM_RRESP   (ram_rresp),    .RAM_RVALID  (ram_rvalid), .RAM_RREADY(ram_rready)
+    .RAM_RDATA   (ram_rdata),   .RAM_RRESP   (ram_rresp),    .RAM_RVALID  (ram_rvalid), .RAM_RREADY(ram_rready),
+
+    .SEG_AWADDR  (seg_awaddr),  .SEG_AWVALID (seg_awvalid),  .SEG_AWREADY (seg_awready),
+    .SEG_WDATA   (seg_wdata),   .SEG_WSTRB   (seg_wstrb),    .SEG_WVALID  (seg_wvalid), .SEG_WREADY(seg_wready),
+    .SEG_BRESP   (seg_bresp),   .SEG_BVALID  (seg_bvalid),   .SEG_BREADY  (seg_bready),
+    .SEG_ARADDR  (seg_araddr),  .SEG_ARVALID (seg_arvalid),  .SEG_ARREADY (seg_arready),
+    .SEG_RDATA   (seg_rdata),   .SEG_RRESP   (seg_rresp),    .SEG_RVALID  (seg_rvalid), .SEG_RREADY(seg_rready)
   );
 
   qspi_axi_top #(
@@ -473,27 +516,8 @@ module basys3_top #(
   // design - a pin/constraint problem, not a reset problem. If THIS
   // blinks but the resetn-gated version didn't, that directly confirms
   // resetn is the actual culprit (stuck permanently asserted).
-  logic [23:0] heartbeat_cnt;
-  initial heartbeat_cnt = 24'h0; // simulation-only: matches what real
-    // hardware already does via its own bitstream-defined register
-    // init value (confirmed working on real silicon - LD14 blinked
-    // correctly). Without this, Icarus specifically has no equivalent
-    // mechanism, so a genuinely reset-free register starts as X and
-    // X-propagates forever (X+1=X) - purely a simulation artifact, not
-    // a real design issue, but worth fixing so simulation results stay
-    // trustworthy going forward.
-  always_ff @(posedge clk) begin
-    heartbeat_cnt <= heartbeat_cnt + 1'b1;
-  end
-
   logic [15:0] led_from_peripheral;
-  // DIAGNOSTIC: led[7:0] show the chip's real Manufacturer ID byte
-  // (from RDID) - 0xC2 confirms Macronix; anything else means every
-  // assumption made so far about this chip's opcodes/QE-bit/timing
-  // needs to be revisited against a different datasheet entirely.
-  // led[8] shows JUST the QE bit (Status Register bit 6) from RDSR -
-  // lit means QE is genuinely set on real silicon.
-  assign led = {trap, heartbeat_cnt[23], led_from_peripheral[13:9], qe_sr_readback[6], qe_jedec_id[23:16]};
+  assign led = led_from_peripheral;
 
   led_peripheral u_led (
     .ACLK    (clk),
@@ -519,6 +543,21 @@ module basys3_top #(
     .S_AXI_BRESP   (ram_bresp),   .S_AXI_BVALID  (ram_bvalid),   .S_AXI_BREADY  (ram_bready),
     .S_AXI_ARADDR  (ram_araddr),  .S_AXI_ARVALID (ram_arvalid),  .S_AXI_ARREADY (ram_arready),
     .S_AXI_RDATA   (ram_rdata),   .S_AXI_RRESP   (ram_rresp),    .S_AXI_RVALID  (ram_rvalid), .S_AXI_RREADY(ram_rready)
+  );
+
+  seven_seg u_seven_seg (
+    .ACLK    (clk),
+    .ARESETn (resetn_main),
+
+    .S_AXI_AWADDR  (seg_awaddr),  .S_AXI_AWVALID (seg_awvalid),  .S_AXI_AWREADY (seg_awready),
+    .S_AXI_WDATA   (seg_wdata),   .S_AXI_WSTRB   (seg_wstrb),    .S_AXI_WVALID  (seg_wvalid), .S_AXI_WREADY(seg_wready),
+    .S_AXI_BRESP   (seg_bresp),   .S_AXI_BVALID  (seg_bvalid),   .S_AXI_BREADY  (seg_bready),
+    .S_AXI_ARADDR  (seg_araddr),  .S_AXI_ARVALID (seg_arvalid),  .S_AXI_ARREADY (seg_arready),
+    .S_AXI_RDATA   (seg_rdata),   .S_AXI_RRESP   (seg_rresp),    .S_AXI_RVALID  (seg_rvalid), .S_AXI_RREADY(seg_rready),
+
+    .seg (seg),
+    .dp  (dp),
+    .an  (an)
   );
 
 endmodule
